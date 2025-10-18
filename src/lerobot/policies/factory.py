@@ -36,7 +36,7 @@ from lerobot.policies.pi0fast.configuration_pi0fast import PI0FASTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig, SmolVLA_CFG_Config
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
@@ -57,7 +57,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
     Args:
         name: The name of the policy. Supported names are "tdmpc", "diffusion", "act",
-              "vqbet", "pi0", "pi0fast", "sac", "reward_classifier", "smolvla".
+              "vqbet", "pi0", "pi0fast", "sac", "reward_classifier", "smolvla", "smolvla_cfg".
 
     Returns:
         The policy class corresponding to the given name.
@@ -101,6 +101,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+    elif name == "smolvla_cfg":
+        from lerobot.policies.smolvla.modeling_smolvla import SmolVLACFGPolicy
+
+        return SmolVLACFGPolicy
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
@@ -140,6 +144,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
+    elif policy_type == "smolvla_cfg":
+        return SmolVLA_CFG_Config(**kwargs)
     elif policy_type == "reward_classifier":
         return RewardClassifierConfig(**kwargs)
     else:
@@ -285,7 +291,7 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
-    elif isinstance(policy_cfg, SmolVLAConfig):
+    elif isinstance(policy_cfg, (SmolVLAConfig, SmolVLA_CFG_Config)):
         from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
 
         processors = make_smolvla_pre_post_processors(

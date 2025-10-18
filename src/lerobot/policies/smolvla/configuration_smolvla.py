@@ -156,3 +156,35 @@ class SmolVLAConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+
+@PreTrainedConfig.register_subclass("smolvla_cfg")
+@dataclass
+class SmolVLA_CFG_Config(SmolVLAConfig):
+    """Extended SmolVLA config that requests historical expert actions for conditioning."""
+
+    history_action_steps: int = 10
+    drop_pastaction_prob: float = 0.3
+    drop_obs_prob: float = 0.3
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.history_action_steps < 0:
+            raise ValueError("`history_action_steps` must be non-negative.")
+        if self.history_action_steps > self.chunk_size:
+            raise ValueError(
+                "`history_action_steps` cannot exceed `chunk_size`, "
+                f"got {self.history_action_steps} and {self.chunk_size}."
+            )
+        for prob_value, name in [
+            (self.drop_pastaction_prob, "drop_pastaction_prob"),
+            (self.drop_obs_prob, "drop_obs_prob"),
+        ]:
+            if not 0.0 <= prob_value <= 1.0:
+                raise ValueError(f"`{name}` must be between 0 and 1, got {prob_value}.")
+
+    @property
+    def action_delta_indices(self) -> list:
+        history = list(range(-self.history_action_steps, 0))
+        future = list(range(self.chunk_size))
+        return history + future

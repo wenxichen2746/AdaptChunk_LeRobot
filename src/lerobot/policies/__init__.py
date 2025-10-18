@@ -17,6 +17,7 @@ from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfi
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0.processor_pi0 import Pi0NewLineProcessor
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
+from .smolvla.configuration_smolvla import SmolVLA_CFG_Config as SmolVLA_CFG_Config
 from .smolvla.processor_smolvla import SmolVLANewLineProcessor
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
@@ -26,6 +27,7 @@ __all__ = [
     "DiffusionConfig",
     "PI0Config",
     "SmolVLAConfig",
+    "SmolVLA_CFG_Config",
     "TDMPCConfig",
     "VQBeTConfig",
 ]
