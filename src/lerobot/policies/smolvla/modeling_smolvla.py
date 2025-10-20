@@ -454,8 +454,14 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
     name = "smolvla_cfg"
 
     def __init__(self, config: SmolVLA_CFG_Config):
+        # Ensure attributes exist before parent initialization hooks run.
         self._history_buffer = None
+        self.model = None
         super().__init__(config)
+        # Replace base model with CFG variant while reusing the RTC processor.
+        self.model = VLAFlowMatching_CFG(config, rtc_processor=self.rtc_processor)
+        # Reinitialize buffers so they align with the CFG model setup.
+        self.reset()
 
     def reset(self):
         super().reset()
@@ -525,17 +531,23 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
                 action_history_mask = action_history_mask.to(device=state.device)
 
         actions = actions.to(device=state.device, dtype=state.dtype)
-        drop_action_history = False
-        drop_obs = False
+        drop_action_history_mask = None
+        drop_obs_mask = None
         if self.training:
             if (
                 self.config.history_action_steps > 0
                 and action_history is not None
                 and self.config.drop_pastaction_prob > 0.0
             ):
-                drop_action_history = torch.rand(1).item() < self.config.drop_pastaction_prob
+                drop_action_history_mask = (
+                    torch.rand(state.shape[0], device=state.device) < self.config.drop_pastaction_prob
+                )
+                if not drop_action_history_mask.any():
+                    drop_action_history_mask = None
             if self.config.drop_obs_prob > 0.0:
-                drop_obs = torch.rand(1).item() < self.config.drop_obs_prob
+                drop_obs_mask = torch.rand(state.shape[0], device=state.device) < self.config.drop_obs_prob
+                if not drop_obs_mask.any():
+                    drop_obs_mask = None
         loss_dict = {}
         losses = self.model.forward(
             images,
@@ -548,8 +560,8 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
             action_history_mask=action_history_mask,
             noise=noise,
             time=time,
-            drop_action_history=drop_action_history,
-            drop_obs=drop_obs,
+            drop_action_history_mask=drop_action_history_mask,
+            drop_obs_mask=drop_obs_mask,
         )
         loss_dict["losses_after_forward"] = losses.clone()
 
@@ -571,7 +583,7 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
         if self._history_buffer is None or len(self._history_buffer) == 0:
             return None, None
 
-        history_tensors = [entry[0] for entry in self._history_buffer]
+        history_tensors = [entry[0].view(-1) for entry in self._history_buffer]
         history_valid = [entry[1] for entry in self._history_buffer]
         history = torch.stack(history_tensors, dim=0).unsqueeze(0)  # (1, hist, action_dim)
         history = pad_vector(history, self.config.max_action_dim).to(device=device, dtype=dtype)
@@ -629,7 +641,7 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
             action_tensor = self._pi_aloha_encode_actions_inv(
                 action_tensor.unsqueeze(0).unsqueeze(0)
             )[0, 0].cpu()
-        self._history_buffer.append((action_tensor, True))
+        self._history_buffer.append((action_tensor.view(-1), True))
 
 
 def pad_tensor(tensor, max_len, pad_value=0):
@@ -653,6 +665,7 @@ def pad_tensor(tensor, max_len, pad_value=0):
     padded_tensor[:, :d] = tensor  # Efficient in-place copy
 
     return padded_tensor
+
 
 
 class VLAFlowMatching(nn.Module):
@@ -720,31 +733,362 @@ class VLAFlowMatching(nn.Module):
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
+
+    def set_requires_grad(self):
+        for params in self.state_proj.parameters():
+            params.requires_grad = self.config.train_state_proj
+
+    def sample_noise(self, shape, device):
+        noise = torch.normal(
+            mean=0.0,
+            std=1.0,
+            size=shape,
+            dtype=torch.float32,
+            device=device,
+        )
+        return noise
+
+    def sample_time(self, bsize, device):
+        beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
+        time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
+        time = time_beta * 0.999 + 0.001
+        return time
+
+    def embed_prefix(
+        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Embed images with SigLIP and language tokens with embedding layer to prepare
+        for SmolVLM transformer processing.
+        """
+        embs = []
+        pad_masks = []
+        att_masks = []
+        for _img_idx, (
+            img,
+            img_mask,
+        ) in enumerate(zip(images, img_masks, strict=False)):
+            if self.add_image_special_tokens:
+                image_start_token = (
+                    self.vlm_with_expert.embed_language_tokens(
+                        self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
+                    )
+                    .unsqueeze(0)
+                    .expand(img.shape[0], -1, -1)
+                )
+                image_start_mask = torch.ones_like(
+                    image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
+                )
+                att_masks += [0] * (image_start_mask.shape[-1])
+                embs.append(image_start_token)
+                pad_masks.append(image_start_mask)
+
+            img_emb = self.vlm_with_expert.embed_image(img)
+            img_emb = img_emb
+
+            # Normalize image embeddings
+            img_emb_dim = img_emb.shape[-1]
+            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+
+            bsize, num_img_embs = img_emb.shape[:2]
+            img_mask = img_mask[:, None].expand(bsize, num_img_embs)
+
+            embs.append(img_emb)
+            pad_masks.append(img_mask)
+
+            att_masks += [0] * (num_img_embs)
+            if self.add_image_special_tokens:
+                image_end_token = (
+                    self.vlm_with_expert.embed_language_tokens(
+                        self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
+                    )
+                    .unsqueeze(0)
+                    .expand(img.shape[0], -1, -1)
+                )
+                image_end_mask = torch.ones_like(
+                    image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
+                )
+                embs.append(image_end_token)
+                pad_masks.append(image_end_mask)
+                att_masks += [0] * (image_end_mask.shape[1])
+        lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
+        # Normalize language embeddings
+        lang_emb_dim = lang_emb.shape[-1]
+        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+
+        embs.append(lang_emb)
+        pad_masks.append(lang_masks)
+
+        num_lang_embs = lang_emb.shape[1]
+        att_masks += [0] * num_lang_embs
+
+        state_emb = self.state_proj(state)
+        state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
+        embs.append(state_emb)
+        bsize = state_emb.shape[0]
+        device = state_emb.device
+
+        states_seq_len = state_emb.shape[1]
+        state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
+        pad_masks.append(state_mask)
+
+        # Set attention masks so that image and language inputs do not attend to state or actions
+        att_masks += [1] * (states_seq_len)
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = att_masks[None, :]
+
+        seq_len = pad_masks.shape[1]
+        if seq_len < self.prefix_length:
+            embs = pad_tensor(embs, self.prefix_length, pad_value=0)
+            pad_masks = pad_tensor(pad_masks, self.prefix_length, pad_value=0)
+            att_masks = pad_tensor(att_masks, self.prefix_length, pad_value=0)
+
+        att_masks = att_masks.expand(bsize, -1)
+
+        return embs, pad_masks, att_masks
+
+    def embed_suffix(self, noisy_actions, timestep):
+        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        # Fuse timestep + action information using an MLP
+        action_emb = self.action_in_proj(noisy_actions)
+        device = action_emb.device
+        bsize = action_emb.shape[0]
+        dtype = action_emb.dtype
+        # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.vlm_with_expert.expert_hidden_size,
+            self.config.min_period,
+            self.config.max_period,
+            device=device,
+        )
+        time_emb = time_emb.type(dtype=dtype)
+
+        time_emb = time_emb[:, None, :].expand_as(action_emb)
+        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+
+        action_time_emb = self.action_time_mlp_in(action_time_emb)
+        action_time_emb = F.silu(action_time_emb)  # swish == silu
+        action_time_emb = self.action_time_mlp_out(action_time_emb)
+
+        # Add to input tokens
+        embs.append(action_time_emb)
+
+        bsize, action_time_dim = action_time_emb.shape[:2]
+        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
+        pad_masks.append(action_time_mask)
+
+        # Set attention masks so that image, language and state inputs do not attend to action tokens
+        att_masks += [1] * self.config.chunk_size
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        return embs, pad_masks, att_masks
+
+    def forward(
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+    ) -> Tensor:
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        # Original openpi code, upcast attention output
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        return losses
+
+    def sample_actions(
+        self, images, img_masks, lang_tokens, lang_masks, state, noise=None, **kwargs
+    ) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        bsize = state.shape[0]
+        device = state.device
+
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        # Compute image and language key value cache
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+        dt = -1.0 / self.config.num_steps
+        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
+
+            # Partial call of the function, I used `partial` package at the beginning
+            # but it was not working as expected, so I used a lambda function instead
+            # I want to pass `x_t` as positionan argument to the partial call, because
+            # it could have different naming in different models, and the rest of parameters
+            # as named arguments
+            denoise_step_partial_call = lambda input_x_t: self.denoise_step(  # noqa: E731
+                x_t=input_x_t,
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                timestep=expanded_time,  # noqa: B023
+            )
+
+            if self.config.rtc_config is not None and self.config.rtc_config.enabled:
+                inference_delay = kwargs.get("inference_delay")
+                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                execution_horizon = kwargs.get("execution_horizon", self.config.rtc_config.execution_horizon)
+
+                v_t = self.rtc_processor.denoise_step(
+                    x_t=x_t,
+                    prev_chunk_left_over=prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    time=time,
+                    original_denoise_step_partial=denoise_step_partial_call,
+                    execution_horizon=execution_horizon,
+                )
+            else:
+                v_t = denoise_step_partial_call(x_t)
+
+            # Euler step
+            x_t += dt * v_t
+            time += dt
+        return x_t
+
+    def denoise_step(
+        self,
+        prefix_pad_masks,
+        past_key_values,
+        x_t,
+        timestep,
+    ):
+        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        outputs_embeds, _ = self.vlm_with_expert.forward(
+            attention_mask=full_att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=False,
+        )
+        suffix_out = outputs_embeds[1]
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
+        return v_t
+
+class VLAFlowMatching_CFG(VLAFlowMatching):
+    """
+    SmolVLA
+
+    [Paper]()
+
+    Designed by Hugging Face.
+    ┌──────────────────────────────┐
+    │                 actions      │
+    │                    ▲         │
+    │ ┌─────────┐      ┌─|────┐    │
+    │ |         │────► │      │    │
+    │ |         │ kv   │      │    │
+    │ |         │────► │Action│    │
+    │ |   VLM   │cache │Expert│    |
+    │ │         │────► |      │    │
+    │ │         │      │      │    │
+    │ └▲──▲───▲─┘      └───▲──┘    |
+    │  │  |   |            │       |
+    │  |  |   |          noise     │
+    │  │  │ state                  │
+    │  │ language tokens           │
+    │  image(s)                    │
+    └──────────────────────────────┘
+    """
+
+    def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
+        super().__init__(config, rtc_processor=rtc_processor)
         self.history_action_steps = getattr(self.config, "history_action_steps", 0)
         if self.history_action_steps > 0:
-            self.history_action_proj = nn.Linear(
-                self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size
-            )
-            expert_dtype = self.vlm_with_expert.lm_expert.layers[0].self_attn.q_proj.weight.dtype
+            text_hidden = self.vlm_with_expert.config.text_config.hidden_size
+            text_dtype = self.vlm_with_expert.get_vlm_model().text_model.layers[0].self_attn.q_proj.weight.dtype
+            self.history_action_proj = nn.Linear(self.config.max_action_dim, text_hidden)
             self.null_pastaction_tokens = nn.Parameter(
                 torch.zeros(
                     1,
                     self.history_action_steps,
-                    self.vlm_with_expert.expert_hidden_size,
-                    dtype=expert_dtype,
+                    text_hidden,
+                    dtype=text_dtype,
                 )
             )
         else:
             self.history_action_proj = None
             self.null_pastaction_tokens = None
-        obs_dtype = self.vlm_with_expert.get_vlm_model().text_model.layers[0].self_attn.q_proj.weight.dtype
-        self.null_observation_token = nn.Parameter(
-            torch.zeros(1, 1, self.vlm_with_expert.config.text_config.hidden_size, dtype=obs_dtype)
-        )
+        self.null_observation_tokens = nn.ParameterDict()
+
+    def _get_null_observation_token(self, key: str, hidden_size: int, dtype, device) -> torch.Tensor:
+        param = self.null_observation_tokens.get(key)
+        if param is None or param.shape[-1] != hidden_size:
+            param = nn.Parameter(torch.zeros(1, 1, hidden_size, dtype=dtype, device=device))
+            self.null_observation_tokens[key] = param
+        else:
+            if param.dtype != dtype or param.device != device:
+                param = nn.Parameter(param.to(device=device, dtype=dtype))
+                self.null_observation_tokens[key] = param
+        return self.null_observation_tokens[key]
 
     def set_requires_grad(self):
-        for params in self.state_proj.parameters():
-            params.requires_grad = self.config.train_state_proj
+        super().set_requires_grad()
 
     def sample_noise(self, shape, device):
         noise = torch.normal(
@@ -771,8 +1115,8 @@ class VLAFlowMatching(nn.Module):
         state: torch.Tensor = None,
         action_history: torch.Tensor | None = None,
         action_history_mask: torch.Tensor | None = None,
-        drop_obs: bool = False,
-        drop_action_history: bool = False,
+        drop_obs_mask: torch.BoolTensor | None = None,
+        drop_action_history_mask: torch.BoolTensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -780,6 +1124,12 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        drop_obs_mask_tensor = None
+        if drop_obs_mask is not None:
+            drop_obs_mask_tensor = drop_obs_mask.to(dtype=torch.bool, device=state.device if state is not None else None)
+        drop_action_history_mask_tensor = None
+        if drop_action_history_mask is not None:
+            drop_action_history_mask_tensor = drop_action_history_mask.to(dtype=torch.bool, device=state.device if state is not None else None)
         for _img_idx, (
             img,
             img_mask,
@@ -788,9 +1138,14 @@ class VLAFlowMatching(nn.Module):
                 image_start_token = self.vlm_with_expert.embed_language_tokens(
                     self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
                 ).unsqueeze(0)
-                if drop_obs and self.null_observation_token is not None:
-                    image_start_token = self.null_observation_token.expand(
-                        img.shape[0], image_start_token.shape[1], -1
+                if drop_obs_mask_tensor is not None:
+                    null_tok = self._get_null_observation_token(
+                        "language", image_start_token.shape[-1], image_start_token.dtype, image_start_token.device
+                    )
+                    image_start_token = torch.where(
+                        drop_obs_mask_tensor[:, None, None],
+                        null_tok.expand(img.shape[0], image_start_token.shape[1], -1),
+                        image_start_token.expand(img.shape[0], -1, -1),
                     )
                 else:
                     image_start_token = image_start_token.expand(img.shape[0], -1, -1)
@@ -811,8 +1166,13 @@ class VLAFlowMatching(nn.Module):
             bsize, num_img_embs = img_emb.shape[:2]
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
 
-            if drop_obs and self.null_observation_token is not None:
-                img_emb = self.null_observation_token.expand(bsize, num_img_embs, -1)
+            if drop_obs_mask_tensor is not None:
+                null_tok = self._get_null_observation_token("vision", img_emb.shape[-1], img_emb.dtype, img_emb.device)
+                img_emb = torch.where(
+                    drop_obs_mask_tensor[:, None, None],
+                    null_tok.expand(bsize, num_img_embs, -1),
+                    img_emb,
+                )
 
             embs.append(img_emb)
             pad_masks.append(img_mask)
@@ -822,9 +1182,14 @@ class VLAFlowMatching(nn.Module):
                 image_end_token = self.vlm_with_expert.embed_language_tokens(
                     self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
                 ).unsqueeze(0)
-                if drop_obs and self.null_observation_token is not None:
-                    image_end_token = self.null_observation_token.expand(
-                        img.shape[0], image_end_token.shape[1], -1
+                if drop_obs_mask_tensor is not None:
+                    null_tok = self._get_null_observation_token(
+                        "language", image_end_token.shape[-1], image_end_token.dtype, image_end_token.device
+                    )
+                    image_end_token = torch.where(
+                        drop_obs_mask_tensor[:, None, None],
+                        null_tok.expand(img.shape[0], image_end_token.shape[1], -1),
+                        image_end_token.expand(img.shape[0], -1, -1),
                     )
                 else:
                     image_end_token = image_end_token.expand(img.shape[0], -1, -1)
@@ -838,8 +1203,13 @@ class VLAFlowMatching(nn.Module):
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
-        if drop_obs and self.null_observation_token is not None:
-            lang_emb = self.null_observation_token.expand(lang_emb.shape[0], lang_emb.shape[1], -1)
+        if drop_obs_mask_tensor is not None:
+            null_tok = self._get_null_observation_token("language", lang_emb.shape[-1], lang_emb.dtype, lang_emb.device)
+            lang_emb = torch.where(
+                drop_obs_mask_tensor[:, None, None],
+                null_tok.expand(lang_emb.shape[0], lang_emb.shape[1], -1),
+                lang_emb,
+            )
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -850,8 +1220,13 @@ class VLAFlowMatching(nn.Module):
         state_emb = self.state_proj(state)
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
         bsize = state_emb.shape[0]
-        if drop_obs and self.null_observation_token is not None:
-            state_emb = self.null_observation_token.expand(bsize, state_emb.shape[1], -1)
+        if drop_obs_mask_tensor is not None:
+            null_tok = self._get_null_observation_token("state", state_emb.shape[-1], state_emb.dtype, state_emb.device)
+            state_emb = torch.where(
+                drop_obs_mask_tensor[:, None, None],
+                null_tok.expand(bsize, state_emb.shape[1], -1),
+                state_emb,
+            )
         embs.append(state_emb)
         device = state_emb.device
 
@@ -864,8 +1239,13 @@ class VLAFlowMatching(nn.Module):
 
         if action_history is not None and self.history_action_proj is not None:
             history_emb = self.history_action_proj(action_history)
-            if drop_action_history and self.null_pastaction_tokens is not None:
-                history_emb = self.null_pastaction_tokens.expand(bsize, -1, -1)
+            if drop_action_history_mask_tensor is not None and self.null_pastaction_tokens is not None:
+                null_tok = self.null_pastaction_tokens.to(device=history_emb.device, dtype=history_emb.dtype)
+                history_emb = torch.where(
+                    drop_action_history_mask_tensor[:, None, None],
+                    null_tok.expand(bsize, history_emb.shape[1], -1),
+                    history_emb,
+                )
             embs.append(history_emb)
             history_len = history_emb.shape[1]
             if action_history_mask is None:
@@ -945,8 +1325,8 @@ class VLAFlowMatching(nn.Module):
         action_history_mask=None,
         noise=None,
         time=None,
-        drop_action_history: bool = False,
-        drop_obs: bool = False,
+        drop_action_history_mask: torch.BoolTensor | None = None,
+        drop_obs_mask: torch.BoolTensor | None = None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -966,8 +1346,8 @@ class VLAFlowMatching(nn.Module):
             state=state,
             action_history=action_history,
             action_history_mask=action_history_mask,
-            drop_obs=drop_obs,
-            drop_action_history=drop_action_history,
+            drop_obs_mask=drop_obs_mask,
+            drop_action_history_mask=drop_action_history_mask,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -1013,6 +1393,13 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
+        drop_obs_mask = None
+        if null_obs:
+            drop_obs_mask = torch.ones(bsize, dtype=torch.bool, device=device)
+        drop_action_history_mask = None
+        if action_history is not None and null_action:
+            drop_action_history_mask = torch.ones(bsize, dtype=torch.bool, device=device)
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images,
             img_masks,
@@ -1021,8 +1408,8 @@ class VLAFlowMatching(nn.Module):
             state=state,
             action_history=action_history,
             action_history_mask=action_history_mask,
-            drop_obs=null_obs,
-            drop_action_history=null_action,
+            drop_obs_mask=drop_obs_mask,
+            drop_action_history_mask=drop_action_history_mask,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
