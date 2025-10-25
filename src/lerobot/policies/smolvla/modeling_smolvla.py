@@ -1058,34 +1058,42 @@ class VLAFlowMatching_CFG(VLAFlowMatching):
 
     def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__(config, rtc_processor=rtc_processor)
+        null_token_dtype = torch.float32
+        text_hidden = self.vlm_with_expert.config.text_config.hidden_size
         self.history_action_steps = getattr(self.config, "history_action_steps", 0)
         if self.history_action_steps > 0:
-            text_hidden = self.vlm_with_expert.config.text_config.hidden_size
-            text_dtype = self.vlm_with_expert.get_vlm_model().text_model.layers[0].self_attn.q_proj.weight.dtype
             self.history_action_proj = nn.Linear(self.config.max_action_dim, text_hidden)
             self.null_pastaction_tokens = nn.Parameter(
                 torch.zeros(
                     1,
                     self.history_action_steps,
                     text_hidden,
-                    dtype=text_dtype,
+                    dtype=null_token_dtype,
                 )
             )
         else:
             self.history_action_proj = None
             self.null_pastaction_tokens = None
-        self.null_observation_tokens = nn.ParameterDict()
+
+        # Pre-create null observation tokens so they participate in the optimizer and have their gradients reset.
+        state_hidden = self.state_proj.out_features
+        self.null_observation_tokens = nn.ParameterDict(
+            {
+                "vision": nn.Parameter(torch.zeros(1, 1, text_hidden, dtype=null_token_dtype)),
+                "language": nn.Parameter(torch.zeros(1, 1, text_hidden, dtype=null_token_dtype)),
+                "state": nn.Parameter(torch.zeros(1, 1, state_hidden, dtype=null_token_dtype)),
+            }
+        )
 
     def _get_null_observation_token(self, key: str, hidden_size: int, dtype, device) -> torch.Tensor:
-        param = self.null_observation_tokens.get(key)
-        if param is None or param.shape[-1] != hidden_size:
-            param = nn.Parameter(torch.zeros(1, 1, hidden_size, dtype=dtype, device=device))
-            self.null_observation_tokens[key] = param
-        else:
-            if param.dtype != dtype or param.device != device:
-                param = nn.Parameter(param.to(device=device, dtype=dtype))
-                self.null_observation_tokens[key] = param
-        return self.null_observation_tokens[key]
+        if key not in self.null_observation_tokens:
+            raise KeyError(f"Unknown null observation token key: {key}")
+        param = self.null_observation_tokens[key]
+        if param.shape[-1] != hidden_size:
+            raise ValueError(f"Unexpected hidden size for null token '{key}': {param.shape[-1]} vs {hidden_size}")
+        if param.dtype == dtype and param.device == device:
+            return param
+        return param.to(device=device, dtype=dtype)
 
     def set_requires_grad(self):
         super().set_requires_grad()

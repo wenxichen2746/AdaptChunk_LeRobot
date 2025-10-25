@@ -164,8 +164,8 @@ class SmolVLA_CFG_Config(SmolVLAConfig):
     """Extended SmolVLA config that requests historical expert actions for conditioning."""
 
     history_action_steps: int = 10
-    drop_pastaction_prob: float = 0.2
-    drop_obs_prob: float = 0.2
+    drop_pastaction_prob: float = 0.0
+    drop_obs_prob: float = 0.0
 
     def __post_init__(self):
         super().__post_init__()
