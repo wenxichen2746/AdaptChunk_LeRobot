@@ -235,7 +235,7 @@ def eval_policy(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     n_episodes: int,
-    max_episodes_rendered: int = 0,
+    max_episodes_rendered: int = 5, #0
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,

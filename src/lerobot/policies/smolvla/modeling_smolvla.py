@@ -456,6 +456,7 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
     def __init__(self, config: SmolVLA_CFG_Config):
         # Ensure attributes exist before parent initialization hooks run.
         self._history_buffer = None
+        self._last_action_chunk: Tensor | None = None
         self.model = None
         super().__init__(config)
         # Replace base model with CFG variant while reusing the RTC processor.
@@ -466,6 +467,7 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
     def reset(self):
         super().reset()
         self._init_history_buffer()
+        self._last_action_chunk = None
 
     def _init_history_buffer(self):
         history_steps = self.config.history_action_steps
@@ -529,6 +531,15 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
             action_history = action_history.to(device=state.device, dtype=state.dtype)
             if action_history_mask is not None:
                 action_history_mask = action_history_mask.to(device=state.device)
+            if (
+                self.training
+                and getattr(self.config, "history_action_noise_std", 0.0) > 0.0
+            ):
+                history_noise = torch.randn_like(action_history) * self.config.history_action_noise_std
+                if action_history_mask is not None:
+                    valid_mask = action_history_mask.unsqueeze(-1).to(dtype=action_history.dtype)
+                    history_noise = history_noise * valid_mask
+                action_history = action_history + history_noise
 
         actions = actions.to(device=state.device, dtype=state.dtype)
         drop_action_history_mask = None
@@ -608,17 +619,48 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
             state.shape[0], state.device, state.dtype
         )
 
-        actions = self.model.sample_actions(
-            images,
-            img_masks,
-            lang_tokens,
-            lang_masks,
-            state,
-            action_history=action_history,
-            action_history_mask=action_history_mask,
-            noise=noise,
-            **kwargs,
-        )
+        decoding_strategy = getattr(self.config, "decoding_strategy", "naive")
+        config_decoding_kwargs = dict(getattr(self.config, "decoding_kwargs", {}) or {})
+        runtime_kwargs = dict(kwargs)
+
+        if decoding_strategy == "cfg":
+            call_kwargs = {**config_decoding_kwargs, **runtime_kwargs}
+            actions = self.model.sample_actions_cfg(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                action_history=action_history,
+                action_history_mask=action_history_mask,
+                noise=noise,
+                **call_kwargs,
+            )
+        elif decoding_strategy == "naive_nulla":
+            actions = self.model.sample_actions(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                action_history=action_history,
+                action_history_mask=action_history_mask,
+                null_action=True,
+                noise=noise,
+                **runtime_kwargs,
+            )
+        else:
+            actions = self.model.sample_actions(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                action_history=action_history,
+                action_history_mask=action_history_mask,
+                noise=noise,
+                **runtime_kwargs,
+            )
 
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
@@ -626,22 +668,49 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
         if self.config.adapt_to_pi_aloha:
             actions = self._pi_aloha_encode_actions(actions)
 
+        self._last_action_chunk = actions
         return actions
 
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs) -> Tensor:
-        action = super().select_action(batch, noise=noise, **kwargs)
+        assert not self._rtc_enabled(), (
+            "RTC is not supported for select_action, use it with predict_action_chunk"
+        )
+
+        self.eval()
+        batch = self._prepare_batch(batch)
+        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+
+        if self._check_get_actions_condition():
+            actions = self._get_action_chunk(batch, noise, **kwargs)
+            self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+
+        action = self._queues[ACTION].popleft()
         self._update_history_buffer(action)
         return action
 
     def _update_history_buffer(self, action: Tensor) -> None:
         if self._history_buffer is None:
             return
-        action_tensor = action.detach().cpu()
+        action_tensor = action.detach()
+
+        # Normalize to (batch, steps, action_dim) so we can handle single actions or chunks.
+        if action_tensor.ndim == 1:
+            action_tensor = action_tensor.unsqueeze(0).unsqueeze(0)
+        elif action_tensor.ndim == 2:
+            action_tensor = action_tensor.unsqueeze(0)
+        elif action_tensor.ndim != 3:
+            raise ValueError(f"Unsupported action tensor shape {tuple(action_tensor.shape)}")
+
         if self.config.adapt_to_pi_aloha:
-            action_tensor = self._pi_aloha_encode_actions_inv(
-                action_tensor.unsqueeze(0).unsqueeze(0)
-            )[0, 0].cpu()
-        self._history_buffer.append((action_tensor.view(-1), True))
+            action_tensor = self._pi_aloha_encode_actions_inv(action_tensor)
+
+        action_tensor = action_tensor.cpu()
+        # Only keep the portion of the chunk that will actually be executed.
+        max_steps = min(action_tensor.shape[1], self.config.n_action_steps)
+        executed_actions = action_tensor[:, :max_steps, :].reshape(-1, action_tensor.shape[-1])
+
+        for step_action in executed_actions:
+            self._history_buffer.append((step_action.clone(), True))
 
 
 def pad_tensor(tensor, max_len, pad_value=0):
@@ -1064,7 +1133,7 @@ class VLAFlowMatching_CFG(VLAFlowMatching):
         if self.history_action_steps > 0:
             self.history_action_proj = nn.Linear(self.config.max_action_dim, text_hidden)
             self.null_pastaction_tokens = nn.Parameter(
-                torch.zeros(
+                torch.randn(
                     1,
                     self.history_action_steps,
                     text_hidden,
@@ -1077,13 +1146,11 @@ class VLAFlowMatching_CFG(VLAFlowMatching):
 
         # Pre-create null observation tokens so they participate in the optimizer and have their gradients reset.
         state_hidden = self.state_proj.out_features
-        self.null_observation_tokens = nn.ParameterDict(
-            {
-                "vision": nn.Parameter(torch.zeros(1, 1, text_hidden, dtype=null_token_dtype)),
-                "language": nn.Parameter(torch.zeros(1, 1, text_hidden, dtype=null_token_dtype)),
-                "state": nn.Parameter(torch.zeros(1, 1, state_hidden, dtype=null_token_dtype)),
-            }
-        )
+        self.null_observation_tokens = nn.ParameterDict({
+            "vision": nn.Parameter(torch.randn(1, 1, text_hidden, dtype=null_token_dtype) * 0.02),
+            "language": nn.Parameter(torch.randn(1, 1, text_hidden, dtype=null_token_dtype) * 0.02),
+            "state": nn.Parameter(torch.randn(1, 1, state_hidden, dtype=null_token_dtype) * 0.02),
+        })
 
     def _get_null_observation_token(self, key: str, hidden_size: int, dtype, device) -> torch.Tensor:
         if key not in self.null_observation_tokens:
@@ -1471,6 +1538,139 @@ class VLAFlowMatching_CFG(VLAFlowMatching):
             time += dt
         return x_t
 
+    def sample_actions_cfg(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        action_history=None,
+        action_history_mask=None,
+        noise=None,
+        **kwargs,
+    ) -> Tensor:
+        """CFG-style decoding using independent nulls for observations and action history."""
+        bsize = state.shape[0]
+        device = state.device
+        dtype = state.dtype
+
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        # Extract combination weights while leaving other kwargs untouched for forward compatibility.
+        local_kwargs = dict(kwargs)
+        w_ao = local_kwargs.pop("w_ao", 1.0)
+        w_on = local_kwargs.pop("w_on", 0.0)
+        w_na = local_kwargs.pop("w_na", 0.0)
+        w_nn = local_kwargs.pop("w_nn", 0.0)
+
+        weight_tensors = {
+            "ao": self._normalize_weight_param(w_ao, bsize, device, dtype),
+            "on": self._normalize_weight_param(w_on, bsize, device, dtype),
+            "na": self._normalize_weight_param(w_na, bsize, device, dtype),
+            "nn": self._normalize_weight_param(w_nn, bsize, device, dtype),
+        }
+
+        combo_specs = [
+            ("ao", False, False),
+            ("on", False, True),
+            ("na", True, False),
+            ("nn", True, True),
+        ]
+        num_variants = len(combo_specs)
+
+        def _repeat_batch(tensor: Tensor | None) -> Tensor | None:
+            if tensor is None:
+                return None
+            repeats = [num_variants] + [1] * (tensor.dim() - 1)
+            return tensor.repeat(*repeats)
+
+        # Repeat observation tensors for each guidance branch.
+        images_rep = [_repeat_batch(img) for img in images]
+        img_masks_rep = [_repeat_batch(mask) for mask in img_masks]
+        state_rep = _repeat_batch(state)
+        lang_tokens_rep = _repeat_batch(lang_tokens)
+        lang_masks_rep = _repeat_batch(lang_masks)
+        action_history_rep = _repeat_batch(action_history)
+        action_history_mask_rep = _repeat_batch(action_history_mask)
+
+        drop_obs_mask_all = torch.cat(
+            [
+                (torch.ones(bsize, dtype=torch.bool, device=device) if null_obs else torch.zeros(
+                    bsize, dtype=torch.bool, device=device))
+                for _, null_obs, _ in combo_specs
+            ],
+            dim=0,
+        )
+
+        if action_history is not None and self.history_action_proj is not None:
+            drop_action_history_mask_all = torch.cat(
+                [
+                    (torch.ones(bsize, dtype=torch.bool, device=device) if null_action else torch.zeros(
+                        bsize, dtype=torch.bool, device=device))
+                    for _, _, null_action in combo_specs
+                ],
+                dim=0,
+            )
+        else:
+            drop_action_history_mask_all = None
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images_rep,
+            img_masks_rep,
+            lang_tokens_rep,
+            lang_masks_rep,
+            state=state_rep,
+            action_history=action_history_rep,
+            action_history_mask=action_history_mask_rep,
+            drop_obs_mask=drop_obs_mask_all,
+            drop_action_history_mask=drop_action_history_mask_all,
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+
+        stacked_weights = torch.stack([weight_tensors[name] for name, _, _ in combo_specs], dim=0)
+
+        dt = torch.tensor(-1.0 / self.config.num_steps, dtype=dtype, device=device)
+        time = torch.tensor(1.0, dtype=dtype, device=device)
+        x_t = noise
+
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
+
+            expanded_time_all = expanded_time.repeat(num_variants)
+            x_t_all = x_t.repeat(num_variants, 1, 1)
+
+            velocities_all = self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=x_t_all,
+                timestep=expanded_time_all,
+            )
+            velocities_all = velocities_all.view(
+                num_variants, bsize, self.config.chunk_size, self.config.max_action_dim
+            )
+
+            v_t = torch.sum(
+                stacked_weights[:, :, None, None] * velocities_all,
+                dim=0,
+            )
+
+            x_t = x_t + dt * v_t
+            time = time + dt
+
+        return x_t
+
     def denoise_step(
         self,
         prefix_pad_masks,
@@ -1505,3 +1705,24 @@ class VLAFlowMatching_CFG(VLAFlowMatching):
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         return v_t
+
+    @staticmethod
+    def _normalize_weight_param(param, batch_size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        if isinstance(param, torch.Tensor):
+            tensor = param.to(device=device, dtype=dtype)
+        else:
+            tensor = torch.as_tensor(param, dtype=dtype, device=device)
+
+        if tensor.ndim == 0:
+            tensor = tensor.expand(batch_size)
+        elif tensor.ndim == 1:
+            if tensor.shape[0] != batch_size:
+                raise ValueError(
+                    f"Weight tensor has leading dimension {tensor.shape[0]}, expected batch size {batch_size}."
+                )
+        else:
+            raise ValueError(
+                f"Weight parameter must be a scalar or 1D tensor, got shape {tuple(tensor.shape)}."
+            )
+
+        return tensor

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -163,10 +164,14 @@ class SmolVLAConfig(PreTrainedConfig):
 class SmolVLA_CFG_Config(SmolVLAConfig):
     """Extended SmolVLA config that requests historical expert actions for conditioning."""
 
+    decoding_strategy: str = "naive"
+    decoding_kwargs: dict[str, Any] = field(default_factory=dict)
     history_action_steps: int = 10
-    drop_pastaction_prob: float = 0.0
-    drop_obs_prob: float = 0.0
+    drop_pastaction_prob: float = 0.2
+    drop_obs_prob: float = 0.2
+    history_action_noise_std: float = 0.2 # for training DR
 
+    optimizer_grad_clip_norm: float = 5.0
     def __post_init__(self):
         super().__post_init__()
         if self.history_action_steps < 0:
@@ -182,6 +187,23 @@ class SmolVLA_CFG_Config(SmolVLAConfig):
         ]:
             if not 0.0 <= prob_value <= 1.0:
                 raise ValueError(f"`{name}` must be between 0 and 1, got {prob_value}.")
+        if self.history_action_noise_std < 0.0:
+            raise ValueError("`history_action_noise_std` must be non-negative.")
+
+        valid_strategies = {"naive", "cfg", "naive_nulla"}
+        if self.decoding_strategy not in valid_strategies:
+            raise ValueError(
+                f"`decoding_strategy` must be one of {sorted(valid_strategies)}, "
+                f"got {self.decoding_strategy!r}."
+            )
+
+        if self.decoding_kwargs is None:
+            self.decoding_kwargs = {}
+        elif not isinstance(self.decoding_kwargs, dict):
+            raise TypeError(
+                f"`decoding_kwargs` must be a dictionary mapping argument names to values, "
+                f"got type {type(self.decoding_kwargs).__name__}."
+            )
 
     @property
     def action_delta_indices(self) -> list:
