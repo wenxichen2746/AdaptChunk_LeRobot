@@ -59,8 +59,11 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
+from lerobot.configs.types import RTCAttentionSchedule
+
 from lerobot.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig, SmolVLA_CFG_Config
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
@@ -457,6 +460,7 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
         # Ensure attributes exist before parent initialization hooks run.
         self._history_buffer = None
         self._last_action_chunk: Tensor | None = None
+        self._last_model_action_chunk: Tensor | None = None
         self.model = None
         super().__init__(config)
         # Replace base model with CFG variant while reusing the RTC processor.
@@ -468,6 +472,7 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
         super().reset()
         self._init_history_buffer()
         self._last_action_chunk = None
+        self._last_model_action_chunk = None
 
     def _init_history_buffer(self):
         history_steps = self.config.history_action_steps
@@ -593,15 +598,28 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
     ) -> tuple[Tensor | None, Tensor | None]:
         if self._history_buffer is None or len(self._history_buffer) == 0:
             return None, None
+        history_tensors: list[Tensor] = []
+        for tensor, _ in self._history_buffer:
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            if tensor.shape[-1] != self.config.max_action_dim:
+                tensor = pad_vector(tensor, self.config.max_action_dim)
+            if tensor.shape[0] == 1 and batch_size > 1:
+                tensor = tensor.expand(batch_size, -1).contiguous()
+            elif tensor.shape[0] != batch_size:
+                raise ValueError(
+                    f"History buffer batch size {tensor.shape[0]} does not match current batch size {batch_size}."
+                )
+            history_tensors.append(tensor.to(device=device, dtype=dtype))
 
-        history_tensors = [entry[0].view(-1) for entry in self._history_buffer]
-        history_valid = [entry[1] for entry in self._history_buffer]
-        history = torch.stack(history_tensors, dim=0).unsqueeze(0)  # (1, hist, action_dim)
-        history = pad_vector(history, self.config.max_action_dim).to(device=device, dtype=dtype)
-        history = history.expand(batch_size, -1, -1).contiguous()
+        history = torch.stack(history_tensors, dim=1)  # (batch, hist, action_dim)
 
-        history_mask = torch.tensor(history_valid, dtype=torch.bool, device=device).unsqueeze(0)
-        history_mask = history_mask.expand(batch_size, -1)
+        history_valid = torch.tensor(
+            [entry[1] for entry in self._history_buffer],
+            dtype=torch.bool,
+            device=device,
+        )
+        history_mask = history_valid.unsqueeze(0).expand(batch_size, -1)
 
         return history, history_mask
 
@@ -622,10 +640,11 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
         decoding_strategy = getattr(self.config, "decoding_strategy", "naive")
         config_decoding_kwargs = dict(getattr(self.config, "decoding_kwargs", {}) or {})
         runtime_kwargs = dict(kwargs)
+        prev_model_chunk = self._last_model_action_chunk
 
         if decoding_strategy == "cfg":
             call_kwargs = {**config_decoding_kwargs, **runtime_kwargs}
-            actions = self.model.sample_actions_cfg(
+            actions_full = self.model.sample_actions_cfg(
                 images,
                 img_masks,
                 lang_tokens,
@@ -636,8 +655,38 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
                 noise=noise,
                 **call_kwargs,
             )
+        elif decoding_strategy == "bid":
+            call_kwargs = {**config_decoding_kwargs, **runtime_kwargs}
+            call_kwargs["prev_action_chunk"] = prev_model_chunk
+            actions_full = self.model.sample_actions_bid(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                action_history=action_history,
+                action_history_mask=action_history_mask,
+                noise=noise,
+                **call_kwargs,
+            )
+        elif decoding_strategy == "rtc":
+            call_kwargs = {**config_decoding_kwargs, **runtime_kwargs}
+            call_kwargs["prev_action_chunk"] = prev_model_chunk
+            with torch.enable_grad():
+                actions_full = self.model.sample_actions_rtc(
+                    images,
+                    img_masks,
+                    lang_tokens,
+                    lang_masks,
+                    state,
+                    action_history=action_history,
+                    action_history_mask=action_history_mask,
+                    noise=noise,
+                    **call_kwargs,
+                )
+            actions_full = actions_full.detach()
         elif decoding_strategy == "naive_nulla":
-            actions = self.model.sample_actions(
+            actions_full = self.model.sample_actions(
                 images,
                 img_masks,
                 lang_tokens,
@@ -650,7 +699,7 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
                 **runtime_kwargs,
             )
         else:
-            actions = self.model.sample_actions(
+            actions_full = self.model.sample_actions(
                 images,
                 img_masks,
                 lang_tokens,
@@ -662,8 +711,10 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
                 **runtime_kwargs,
             )
 
+        self._last_model_action_chunk = actions_full.detach()
+
         original_action_dim = self.config.action_feature.shape[0]
-        actions = actions[:, :, :original_action_dim]
+        actions = actions_full[:, :, :original_action_dim]
 
         if self.config.adapt_to_pi_aloha:
             actions = self._pi_aloha_encode_actions(actions)
@@ -688,29 +739,22 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
         self._update_history_buffer(action)
         return action
 
+
     def _update_history_buffer(self, action: Tensor) -> None:
         if self._history_buffer is None:
             return
-        action_tensor = action.detach()
+        step_action = action.detach()
 
-        # Normalize to (batch, steps, action_dim) so we can handle single actions or chunks.
-        if action_tensor.ndim == 1:
-            action_tensor = action_tensor.unsqueeze(0).unsqueeze(0)
-        elif action_tensor.ndim == 2:
-            action_tensor = action_tensor.unsqueeze(0)
-        elif action_tensor.ndim != 3:
-            raise ValueError(f"Unsupported action tensor shape {tuple(action_tensor.shape)}")
+        if step_action.ndim == 1:
+            step_action = step_action.unsqueeze(0)
+        elif step_action.ndim != 2:
+            raise ValueError(f"Unsupported action tensor shape {tuple(step_action.shape)}")
 
         if self.config.adapt_to_pi_aloha:
-            action_tensor = self._pi_aloha_encode_actions_inv(action_tensor)
+            step_action = self._pi_aloha_encode_actions_inv(step_action.unsqueeze(1))[:, 0, :]
 
-        action_tensor = action_tensor.cpu()
-        # Only keep the portion of the chunk that will actually be executed.
-        max_steps = min(action_tensor.shape[1], self.config.n_action_steps)
-        executed_actions = action_tensor[:, :max_steps, :].reshape(-1, action_tensor.shape[-1])
-
-        for step_action in executed_actions:
-            self._history_buffer.append((step_action.clone(), True))
+        step_action = pad_vector(step_action, self.config.max_action_dim).cpu()
+        self._history_buffer.append((step_action.clone(), True))
 
 
 def pad_tensor(tensor, max_len, pad_value=0):
@@ -1064,6 +1108,303 @@ class VLAFlowMatching(nn.Module):
             time += dt
         return x_t
 
+    def sample_actions_bid(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        action_history=None,
+        action_history_mask=None,
+        *,
+        prev_action_chunk: Tensor | None = None,
+        inference_delay: int = 0,
+        prefix_attention_horizon: int | None = None,
+        n_samples: int = 4,
+        prefix_attention_schedule: str | RTCAttentionSchedule = "exp",
+        noise=None,
+        **kwargs,
+    ) -> Tensor:
+        """Bidirectional Inference Decoding (BID) with overlap-aware backward loss."""
+        del kwargs  # intentionally unused
+
+        if n_samples <= 0:
+            raise ValueError("`n_samples` must be a positive integer.")
+
+        bsize = state.shape[0]
+        device = state.device
+        dtype = state.dtype
+
+        if prev_action_chunk is None or prev_action_chunk.shape[0] != bsize:
+            return self.sample_actions(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                action_history=action_history,
+                action_history_mask=action_history_mask,
+                noise=noise,
+            )
+
+        prev_action_chunk = prev_action_chunk.to(device=device, dtype=dtype)
+
+        overlap_start = min(self.config.n_action_steps, prev_action_chunk.shape[1])
+        if overlap_start >= prev_action_chunk.shape[1]:
+            return self.sample_actions(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                action_history=action_history,
+                action_history_mask=action_history_mask,
+                noise=noise,
+            )
+
+        prev_overlap_full = prev_action_chunk[:, overlap_start:, :]
+        overlap_len = min(prev_overlap_full.shape[1], self.config.n_action_steps)
+        if overlap_len <= 0:
+            return self.sample_actions(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                action_history=action_history,
+                action_history_mask=action_history_mask,
+                noise=noise,
+            )
+
+        schedule_value = (
+            prefix_attention_schedule.value
+            if isinstance(prefix_attention_schedule, RTCAttentionSchedule)
+            else str(prefix_attention_schedule)
+        )
+        prefix_attention_horizon = prefix_attention_horizon or overlap_len
+        weights = self._compute_prefix_weights(
+            inference_delay=inference_delay,
+            horizon=prefix_attention_horizon,
+            total=overlap_len,
+            schedule=schedule_value,
+            device=device,
+            dtype=dtype,
+        )
+
+        if noise is None:
+            noise = self.sample_noise(
+                (bsize, self.config.chunk_size, self.config.max_action_dim),
+                device,
+            )
+
+        if noise.shape[0] == bsize:
+            noise_all = noise.repeat(n_samples, 1, 1)
+        elif noise.shape[0] == n_samples * bsize:
+            noise_all = noise
+        else:
+            raise ValueError(
+                f"`noise` must have shape ({bsize}, C, A) or ({n_samples * bsize}, C, A); "
+                f"got {tuple(noise.shape)}."
+            )
+
+        def _repeat_batch(tensor: Tensor | None) -> Tensor | None:
+            if tensor is None:
+                return None
+            repeats = [n_samples] + [1] * (tensor.dim() - 1)
+            return tensor.repeat(*repeats)
+
+        images_rep = [_repeat_batch(img) for img in images]
+        img_masks_rep = [_repeat_batch(mask) for mask in img_masks]
+        state_rep = _repeat_batch(state)
+        lang_tokens_rep = _repeat_batch(lang_tokens)
+        lang_masks_rep = _repeat_batch(lang_masks)
+        action_history_rep = _repeat_batch(action_history)
+        action_history_mask_rep = _repeat_batch(action_history_mask)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images_rep,
+            img_masks_rep,
+            lang_tokens_rep,
+            lang_masks_rep,
+            state=state_rep,
+            action_history=action_history_rep,
+            action_history_mask=action_history_mask_rep,
+            drop_obs_mask=None,
+            drop_action_history_mask=None,
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+
+        dt = torch.tensor(-1.0 / self.config.num_steps, dtype=dtype, device=device)
+        time = torch.tensor(1.0, dtype=dtype, device=device)
+        x_t = noise_all
+        batch_ext = n_samples * bsize
+
+        while time >= -dt / 2:
+            expanded_time = time.expand(batch_ext)
+            v_t = self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=x_t,
+                timestep=expanded_time,
+            )
+            x_t = x_t + dt * v_t
+            time = time + dt
+
+        strong_actions = x_t.view(
+            n_samples, bsize, self.config.chunk_size, self.config.max_action_dim
+        )
+        prev_overlap = prev_overlap_full[:, :overlap_len, :]
+        new_overlap = strong_actions[:, :, :overlap_len, :]
+
+        diff = torch.linalg.norm(new_overlap - prev_overlap.unsqueeze(0), dim=-1)
+        weighted_diff = diff * weights[None, None, :]
+        loss = weighted_diff.sum(dim=-1)
+
+        best_indices = torch.argmin(loss, dim=0)
+        batch_indices = torch.arange(bsize, device=device)
+        best_actions = strong_actions[best_indices, batch_indices]
+        return best_actions
+
+    def sample_actions_rtc(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        action_history=None,
+        action_history_mask=None,
+        *,
+        prev_action_chunk: Tensor | None = None,
+        inference_delay: int = 0,
+        execution_horizon: int | None = None,
+        prefix_attention_schedule: str | RTCAttentionSchedule | None = "exp",
+        max_guidance_weight: float | None = None,
+        noise=None,
+        **kwargs,
+    ) -> Tensor:
+        """Real-Time Chunking decoding that mirrors the RTC processor behaviour."""
+        del kwargs  # unused runtime kwargs reserved for future use
+
+        bsize = state.shape[0]
+        device = state.device
+        dtype = state.dtype
+
+        if noise is None:
+            noise = self.sample_noise(
+                (bsize, self.config.chunk_size, self.config.max_action_dim),
+                device,
+            )
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            action_history=action_history,
+            action_history_mask=action_history_mask,
+            drop_obs_mask=None,
+            drop_action_history_mask=None,
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+
+        rtc_cfg = self.config.rtc_config
+        if rtc_cfg is None:
+            rtc_cfg = RTCConfig()
+            self.config.rtc_config = rtc_cfg
+
+        if self.rtc_processor is None:
+            self.rtc_processor = RTCProcessor(rtc_cfg)
+
+        prev_chunk_left_over = None
+        overlap_len = 0
+        if prev_action_chunk is not None and prev_action_chunk.shape[0] == bsize:
+            prev_action_chunk = prev_action_chunk.to(device=device, dtype=dtype)
+            executed = min(self.config.n_action_steps, prev_action_chunk.shape[1])
+            if executed < prev_action_chunk.shape[1]:
+                leftover = prev_action_chunk[:, executed:, :]
+                if leftover.shape[1] > 0:
+                    overlap_len = min(leftover.shape[1], self.config.chunk_size)
+                    prev_chunk_left_over = torch.zeros(
+                        bsize,
+                        self.config.chunk_size,
+                        self.config.max_action_dim,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    dim = min(leftover.shape[2], self.config.max_action_dim)
+                    prev_chunk_left_over[:, :overlap_len, :dim] = leftover[:, :overlap_len, :dim]
+
+        schedule_value = prefix_attention_schedule or rtc_cfg.prefix_attention_schedule
+        schedule_enum = (
+            schedule_value
+            if isinstance(schedule_value, RTCAttentionSchedule)
+            else RTCAttentionSchedule(schedule_value.upper())
+        )
+
+        execution_horizon_default = rtc_cfg.execution_horizon or self.config.n_action_steps
+        execution_horizon_eff = execution_horizon or execution_horizon_default
+        if overlap_len > 0:
+            execution_horizon_eff = min(execution_horizon_eff, overlap_len)
+        execution_horizon_eff = max(0, execution_horizon_eff)
+
+        max_guidance_weight_eff = (
+            max_guidance_weight if max_guidance_weight is not None else rtc_cfg.max_guidance_weight
+        )
+
+        # Temporarily override RTC config to reuse the standard sample_actions implementation.
+        enabled_prev = rtc_cfg.enabled
+        schedule_prev = rtc_cfg.prefix_attention_schedule
+        execution_prev = rtc_cfg.execution_horizon
+        weight_prev = rtc_cfg.max_guidance_weight
+
+        rtc_cfg.enabled = True
+        rtc_cfg.prefix_attention_schedule = schedule_enum
+        rtc_cfg.execution_horizon = execution_horizon_eff
+        rtc_cfg.max_guidance_weight = max_guidance_weight_eff
+
+        try:
+            actions = self.sample_actions(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                action_history=action_history,
+                action_history_mask=action_history_mask,
+                noise=noise,
+                inference_delay=inference_delay,
+                prev_chunk_left_over=prev_chunk_left_over,
+                execution_horizon=execution_horizon_eff,
+            )
+        finally:
+            rtc_cfg.enabled = enabled_prev
+            rtc_cfg.prefix_attention_schedule = schedule_prev
+            rtc_cfg.execution_horizon = execution_prev
+            rtc_cfg.max_guidance_weight = weight_prev
+
+        return actions
+
     def denoise_step(
         self,
         prefix_pad_masks,
@@ -1138,8 +1479,9 @@ class VLAFlowMatching_CFG(VLAFlowMatching):
                     self.history_action_steps,
                     text_hidden,
                     dtype=null_token_dtype,
-                )
+                ) * 0.02
             )
+
         else:
             self.history_action_proj = None
             self.null_pastaction_tokens = None
@@ -1314,6 +1656,7 @@ class VLAFlowMatching_CFG(VLAFlowMatching):
 
         if action_history is not None and self.history_action_proj is not None:
             history_emb = self.history_action_proj(action_history)
+            # history_emb = history_emb * math.sqrt(history_emb.shape[-1])
             if drop_action_history_mask_tensor is not None and self.null_pastaction_tokens is not None:
                 null_tok = self.null_pastaction_tokens.to(device=history_emb.device, dtype=history_emb.dtype)
                 history_emb = torch.where(
@@ -1329,6 +1672,7 @@ class VLAFlowMatching_CFG(VLAFlowMatching):
                 history_mask = action_history_mask.to(dtype=torch.bool, device=history_emb.device)
             pad_masks.append(history_mask)
             att_masks += [1] * history_len
+            # att_masks += [0] * history_len
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -1517,21 +1861,21 @@ class VLAFlowMatching_CFG(VLAFlowMatching):
                 timestep=expanded_time,  # noqa: B023
             )
 
-            if self.config.rtc_config is not None and self.config.rtc_config.enabled:
-                inference_delay = kwargs.get("inference_delay")
-                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
-                execution_horizon = kwargs.get("execution_horizon", self.config.rtc_config.execution_horizon)
+            # if self.config.rtc_config is not None and self.config.rtc_config.enabled:
+            #     inference_delay = kwargs.get("inference_delay")
+            #     prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+            #     execution_horizon = kwargs.get("execution_horizon", self.config.rtc_config.execution_horizon)
 
-                v_t = self.rtc_processor.denoise_step(
-                    x_t=x_t,
-                    prev_chunk_left_over=prev_chunk_left_over,
-                    inference_delay=inference_delay,
-                    time=time,
-                    original_denoise_step_partial=denoise_step_partial_call,
-                    execution_horizon=execution_horizon,
-                )
-            else:
-                v_t = denoise_step_partial_call(x_t)
+            #     v_t = self.rtc_processor.denoise_step(
+            #         x_t=x_t,
+            #         prev_chunk_left_over=prev_chunk_left_over,
+            #         inference_delay=inference_delay,
+            #         time=time,
+            #         original_denoise_step_partial=denoise_step_partial_call,
+            #         execution_horizon=execution_horizon,
+            #     )
+            # else:
+            v_t = denoise_step_partial_call(x_t)
 
             # Euler step
             x_t += dt * v_t
@@ -1726,3 +2070,38 @@ class VLAFlowMatching_CFG(VLAFlowMatching):
             )
 
         return tensor
+
+    @staticmethod
+    def _compute_prefix_weights(
+        *,
+        inference_delay: int,
+        horizon: int,
+        total: int,
+        schedule: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        if total <= 0:
+            return torch.zeros(0, device=device, dtype=dtype)
+
+        start = max(0, min(int(inference_delay), total))
+        end = max(0, min(int(horizon), total))
+        start = min(start, end)
+        indices = torch.arange(total, device=device, dtype=dtype)
+
+        schedule_key = schedule.lower()
+        if schedule_key == "ones":
+            weights = torch.ones(total, device=device, dtype=dtype)
+        elif schedule_key == "zeros":
+            weights = (indices < start).to(dtype)
+        elif schedule_key in {"linear", "exp"}:
+            denom = max(end - start + 1, 1)
+            weights = (start - 1 - indices) / denom + 1
+            weights = torch.clamp(weights, min=0.0, max=1.0)
+            if schedule_key == "exp":
+                weights = weights * torch.expm1(weights) / (math.e - 1)
+        else:
+            raise ValueError(f"Invalid prefix attention schedule: {schedule}")
+
+        weights = torch.where(indices >= end, torch.zeros_like(weights), weights)
+        return weights.to(dtype=dtype)

@@ -18,18 +18,19 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.scripts.eval import eval_policy_all
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import get_safe_torch_device, init_logging
-
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # POLICY_PATH = Path("outputs/cfg_1025/checkpoints/020000/pretrained_model")
 # OUTPUT_ROOT = Path("./eval_result/tests_cfg_1025_chunksize50")
 # POLICY_PATH = Path("outputs/batch64_actioncondition_nocfg/checkpoints/020000/pretrained_model")
 # OUTPUT_ROOT = Path("./eval_result/tests_nocfg_chunksize50")
 POLICY_PATH = Path("outputs/cfg_1030_drpastactions_40k/checkpoints/040000/pretrained_model")
-OUTPUT_ROOT = Path("./eval_result/cfg_1030_drpastactions_40k")
+OUTPUT_ROOT = Path("./eval_result/cfg_1030_drpastactions_40k_1102")
 
 
 EVAL_SEED = 1000
-EVAL_SETTINGS = SimpleNamespace(batch_size=5, n_episodes=20, use_async_envs=False, max_episodes_rendered=5)
+EVAL_SETTINGS = SimpleNamespace(batch_size=5, n_episodes=10,use_async_envs=False, max_episodes_rendered=5)
 ENV_SETTINGS = LiberoEnv(task="libero_10", max_parallel_tasks=1)
 
 
@@ -99,51 +100,68 @@ def main():
     init_logging()
     set_seed(EVAL_SEED)
     evaluations = []
-    for execution_horizon in [10,20,30,1,5]:
-        print(f"=== Evaluation with execution_horizon={execution_horizon} ===")
+    for execution_horizon in [10,15,20,1,5,30]:
+        # print(f"=== Evaluation with execution_horizon={execution_horizon} ===")
         prefix = f"h{execution_horizon}"
-        evaluations.append((f"{prefix}_naive_nulla", "naive_nulla", {}, execution_horizon))
-        evaluations.append((f"{prefix}_naive", "naive", {}, execution_horizon))
+        # evaluations.append((f"{prefix}_naive_nulla", "naive_nulla", {}, execution_horizon))
+        # evaluations.append((f"{prefix}_naive", "naive", {}, execution_horizon))
+        evaluations.append(
+            (
+                f"{prefix}_rtc_exp",
+                "rtc",
+                {"prefix_attention_schedule": "EXP"},
+                execution_horizon,
+            )
+        )
+        evaluations.append(
+            (
+                f"{prefix}_bid_exp",
+                "bid",
+                {"prefix_attention_schedule": "exp"},
+                execution_horizon,
+            )
+        )
 
-        # for w in range(2, 5):
-        #     w_nn = 1 - w
-        #     w_on = w
-        #     w_ao = 0.0
-        #     w_na = 0.0
-        #     evaluations.append(
-        #         (
-        #             f"{prefix}_cfg_BI_wo_{w}",
-        #             "cfg",
-        #             {"w_ao": w_ao, "w_on": w_on, "w_na": w_na, "w_nn": w_nn},
-        #             execution_horizon,
-        #         )
-        #     )
-        # for w in range(2, 5):
-        #     w_nn = 1 - w
-        #     w_on = 0.0
-        #     w_ao = 0.0
-        #     w_na = w
-        #     evaluations.append(
-        #         (
-        #             f"{prefix}_cfg_BI_wa_{w}",
-        #             "cfg",
-        #             {"w_ao": w_ao, "w_on": w_on, "w_na": w_na, "w_nn": w_nn},
-        #             execution_horizon,
-        #         )
-        #     )
-        # for w in range(2, 5):
-        #     w_nn = 0.0
-        #     w_on = 1 - w
-        #     w_ao = w
-        #     w_na = 0.0
-        #     evaluations.append(
-        #         (
-        #             f"{prefix}_cfg_BF_wa_{w}",
-        #             "cfg",
-        #             {"w_ao": w_ao, "w_on": w_on, "w_na": w_na, "w_nn": w_nn},
-        #             execution_horizon,
-        #         )
-        #     )
+
+        for w in range(2, 5):
+            w_nn = 1 - w
+            w_on = w
+            w_ao = 0.0
+            w_na = 0.0
+            evaluations.append(
+                (
+                    f"{prefix}_cfg_BI_wo_{w}",
+                    "cfg",
+                    {"w_ao": w_ao, "w_on": w_on, "w_na": w_na, "w_nn": w_nn},
+                    execution_horizon,
+                )
+            )
+        for w in range(2, 5):
+            w_nn = 1 - w
+            w_on = 0.0
+            w_ao = 0.0
+            w_na = w
+            evaluations.append(
+                (
+                    f"{prefix}_cfg_BI_wa_{w}",
+                    "cfg",
+                    {"w_ao": w_ao, "w_on": w_on, "w_na": w_na, "w_nn": w_nn},
+                    execution_horizon,
+                )
+            )
+        for w in range(2, 5):
+            w_nn = 0.0
+            w_on = 1 - w
+            w_ao = w
+            w_na = 0.0
+            evaluations.append(
+                (
+                    f"{prefix}_cfg_BF_wa_{w}",
+                    "cfg",
+                    {"w_ao": w_ao, "w_on": w_on, "w_na": w_na, "w_nn": w_nn},
+                    execution_horizon,
+                )
+            )
 
     start_time = time.time()
     elapsed_history: list[float] = []
@@ -163,7 +181,7 @@ def main():
         eta_seconds = remaining_runs * avg_elapsed
 
         print(f"==== {run_name} ====")
-        print(info["overall"])
+        # print(info["overall"])
         print(
             f"Run time: {run_elapsed/60:.2f} min | "
             f"Average: {avg_elapsed/60:.2f} min | "

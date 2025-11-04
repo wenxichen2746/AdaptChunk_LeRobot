@@ -166,11 +166,12 @@ class SmolVLA_CFG_Config(SmolVLAConfig):
 
     decoding_strategy: str = "naive"
     decoding_kwargs: dict[str, Any] = field(default_factory=dict)
-    history_action_steps: int = 10
+    history_action_steps: int = 20 #10
     drop_pastaction_prob: float = 0.2
     drop_obs_prob: float = 0.2
     history_action_noise_std: float = 0.2 # for training DR
 
+    rtc_config=None
     optimizer_grad_clip_norm: float = 5.0
     def __post_init__(self):
         super().__post_init__()
@@ -190,7 +191,7 @@ class SmolVLA_CFG_Config(SmolVLAConfig):
         if self.history_action_noise_std < 0.0:
             raise ValueError("`history_action_noise_std` must be non-negative.")
 
-        valid_strategies = {"naive", "cfg", "naive_nulla"}
+        valid_strategies = {"naive", "cfg", "naive_nulla", "bid", "rtc"}
         if self.decoding_strategy not in valid_strategies:
             raise ValueError(
                 f"`decoding_strategy` must be one of {sorted(valid_strategies)}, "
