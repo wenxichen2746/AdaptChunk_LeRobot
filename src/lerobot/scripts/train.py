@@ -54,6 +54,8 @@ from lerobot.utils.utils import (
 )
 from lerobot.utils.wandb_utils import WandBLogger
 
+import warnings
+warnings.filterwarnings("ignore", message="WandB logging of key .* was ignored as its type .* is not handled by this wrapper.")
 
 def update_policy(
     train_metrics: MetricsTracker,

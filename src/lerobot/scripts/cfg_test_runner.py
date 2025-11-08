@@ -25,12 +25,13 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # OUTPUT_ROOT = Path("./eval_result/tests_cfg_1025_chunksize50")
 # POLICY_PATH = Path("outputs/batch64_actioncondition_nocfg/checkpoints/020000/pretrained_model")
 # OUTPUT_ROOT = Path("./eval_result/tests_nocfg_chunksize50")
-POLICY_PATH = Path("outputs/cfg_1030_drpastactions_40k/checkpoints/040000/pretrained_model")
-OUTPUT_ROOT = Path("./eval_result/cfg_1030_drpastactions_40k_1102")
-
+# POLICY_PATH = Path("outputs/cfg_1030_drpastactions_40k/checkpoints/040000/pretrained_model")
+# OUTPUT_ROOT = Path("./eval_result/cfg_1030_drpastactions_40k_1102")
+POLICY_PATH = Path("outputs/cfg_1104_20pastactions/checkpoints/040000/pretrained_model")
+OUTPUT_ROOT = Path("./eval_result/cfg_1104_20pastactions")
 
 EVAL_SEED = 1000
-EVAL_SETTINGS = SimpleNamespace(batch_size=5, n_episodes=10,use_async_envs=False, max_episodes_rendered=5)
+EVAL_SETTINGS = SimpleNamespace(batch_size=5, n_episodes=10,use_async_envs=False, max_episodes_rendered=3)
 ENV_SETTINGS = LiberoEnv(task="libero_10", max_parallel_tasks=1)
 
 
@@ -103,8 +104,8 @@ def main():
     for execution_horizon in [10,15,20,1,5,30]:
         # print(f"=== Evaluation with execution_horizon={execution_horizon} ===")
         prefix = f"h{execution_horizon}"
-        # evaluations.append((f"{prefix}_naive_nulla", "naive_nulla", {}, execution_horizon))
-        # evaluations.append((f"{prefix}_naive", "naive", {}, execution_horizon))
+        evaluations.append((f"{prefix}_naive_nulla", "naive_nulla", {}, execution_horizon))
+        evaluations.append((f"{prefix}_naive", "naive", {}, execution_horizon))
         evaluations.append(
             (
                 f"{prefix}_rtc_exp",
@@ -123,11 +124,11 @@ def main():
         )
 
 
-        for w in range(2, 5):
-            w_nn = 1 - w
+        for w in [1.2,1.4,1.6]:
+            w_nn = 1 - w -1
             w_on = w
             w_ao = 0.0
-            w_na = 0.0
+            w_na = 1.0
             evaluations.append(
                 (
                     f"{prefix}_cfg_BI_wo_{w}",
@@ -136,9 +137,9 @@ def main():
                     execution_horizon,
                 )
             )
-        for w in range(2, 5):
-            w_nn = 1 - w
-            w_on = 0.0
+        for w in [1.2,1.4,1.6]:
+            w_nn = 1 - w -1
+            w_on = 1.0 #updated
             w_ao = 0.0
             w_na = w
             evaluations.append(
@@ -149,7 +150,7 @@ def main():
                     execution_horizon,
                 )
             )
-        for w in range(2, 5):
+        for w in [1, 1.2,1.4,1.6]:
             w_nn = 0.0
             w_on = 1 - w
             w_ao = w

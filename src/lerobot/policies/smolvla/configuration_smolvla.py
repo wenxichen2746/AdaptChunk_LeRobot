@@ -167,9 +167,9 @@ class SmolVLA_CFG_Config(SmolVLAConfig):
     decoding_strategy: str = "naive"
     decoding_kwargs: dict[str, Any] = field(default_factory=dict)
     history_action_steps: int = 20 #10
-    drop_pastaction_prob: float = 0.2
-    drop_obs_prob: float = 0.2
-    history_action_noise_std: float = 0.2 # for training DR
+    drop_pastaction_prob: float = 0.15
+    drop_obs_prob: float = 0.15
+    history_action_noise_std: float = 0.1             #Training dr
 
     rtc_config=None
     optimizer_grad_clip_norm: float = 5.0
