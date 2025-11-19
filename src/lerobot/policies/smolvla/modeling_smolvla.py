@@ -236,6 +236,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self._last_action_chunk: Tensor | None = None
+        self._last_model_action_chunk: Tensor | None = None
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
@@ -245,6 +247,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._last_action_chunk = None
+        self._last_model_action_chunk = None
 
     def init_rtc_processor(self):
         self.rtc_processor = None
@@ -261,12 +265,34 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    # def _get_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs) -> Tensor:
+    #     # TODO: Check if this for loop is needed.
+    #     # Context: In fact, self.queues contains only ACTION field, and in inference, we don't have action in the batch
+    #     # In the case of offline inference, we have the action in the batch
+    #     # that why without the k != ACTION check, it will raise an error because we are trying to stack
+    #     # on an empty container.
+    #     for k in batch:
+    #         if k in self._queues and k != ACTION:
+    #             batch[k] = torch.stack(list(self._queues[k]), dim=1)
+
+    #     images, img_masks = self.prepare_images(batch)
+    #     state = self.prepare_state(batch)
+    #     lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+    #     lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+    #     actions = self.model.sample_actions(
+    #         images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+    #     )
+
+    #     # Unpad actions
+    #     original_action_dim = self.config.action_feature.shape[0]
+    #     actions = actions[:, :, :original_action_dim]
+
+    #     if self.config.adapt_to_pi_aloha:
+    #         actions = self._pi_aloha_encode_actions(actions)
+
+    #     return actions
     def _get_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs) -> Tensor:
-        # TODO: Check if this for loop is needed.
-        # Context: In fact, self.queues contains only ACTION field, and in inference, we don't have action in the batch
-        # In the case of offline inference, we have the action in the batch
-        # that why without the k != ACTION check, it will raise an error because we are trying to stack
-        # on an empty container.
         for k in batch:
             if k in self._queues and k != ACTION:
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
@@ -276,36 +302,85 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
-        )
+        decoding_strategy = getattr(self.config, "decoding_strategy", "naive")
+        config_decoding_kwargs = dict(getattr(self.config, "decoding_kwargs", {}) or {})
+        runtime_kwargs = dict(kwargs)
+        prev_model_chunk = self._last_model_action_chunk
 
-        # Unpad actions
+        if decoding_strategy == "bid":
+            call_kwargs = {**config_decoding_kwargs, **runtime_kwargs}
+            call_kwargs["prev_action_chunk"] = prev_model_chunk
+            actions_full = self.model.sample_actions_bid(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                noise=noise,
+                **call_kwargs,
+            )
+        elif decoding_strategy == "rtc":
+            call_kwargs = {**config_decoding_kwargs, **runtime_kwargs}
+            call_kwargs["prev_action_chunk"] = prev_model_chunk
+            with torch.enable_grad():
+                actions_full = self.model.sample_actions_rtc(
+                    images,
+                    img_masks,
+                    lang_tokens,
+                    lang_masks,
+                    state,
+                    noise=noise,
+                    **call_kwargs,
+                )
+            actions_full = actions_full.detach()
+        elif decoding_strategy in {"naive", "default"}:
+            call_kwargs = {**config_decoding_kwargs, **runtime_kwargs}
+            actions_full = self.model.sample_actions(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                noise=noise,
+                **call_kwargs,
+            )
+        else:
+            raise ValueError(
+                f"Decoding strategy '{decoding_strategy}' is not supported by SmolVLAPolicy. "
+                "Use SmolVLACFGPolicy for CFG or history-aware decoding."
+            )
+
+        self._last_model_action_chunk = actions_full.detach()
+
         original_action_dim = self.config.action_feature.shape[0]
-        actions = actions[:, :, :original_action_dim]
+        actions = actions_full[:, :, :original_action_dim]
 
         if self.config.adapt_to_pi_aloha:
             actions = self._pi_aloha_encode_actions(actions)
 
+        self._last_action_chunk = actions
         return actions
-
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
 
         return batch
 
-    @torch.no_grad()
+    def _decoding_requires_grad(self) -> bool:
+        strategy = getattr(self.config, "decoding_strategy", "naive")
+        return strategy == "rtc"
+
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs) -> Tensor:
         self.eval()
 
         batch = self._prepare_batch(batch)
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
-        actions = self._get_action_chunk(batch, noise, **kwargs)
+        grad_ctx = torch.enable_grad() if self._decoding_requires_grad() else torch.no_grad()
+        with grad_ctx:
+            actions = self._get_action_chunk(batch, noise, **kwargs)
         return actions
 
-    @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs) -> Tensor:
         """Select a single action given environment observations.
 
@@ -323,7 +398,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         if self._check_get_actions_condition():
-            actions = self._get_action_chunk(batch, noise)
+            grad_ctx = torch.enable_grad() if self._decoding_requires_grad() else torch.no_grad()
+            with grad_ctx:
+                actions = self._get_action_chunk(batch, noise, **kwargs)
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
@@ -723,22 +800,9 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
         return actions
 
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs) -> Tensor:
-        assert not self._rtc_enabled(), (
-            "RTC is not supported for select_action, use it with predict_action_chunk"
-        )
-
-        self.eval()
-        batch = self._prepare_batch(batch)
-        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
-
-        if self._check_get_actions_condition():
-            actions = self._get_action_chunk(batch, noise, **kwargs)
-            self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
-
-        action = self._queues[ACTION].popleft()
+        action = super().select_action(batch, noise, **kwargs)
         self._update_history_buffer(action)
         return action
-
 
     def _update_history_buffer(self, action: Tensor) -> None:
         if self._history_buffer is None:
@@ -755,7 +819,6 @@ class SmolVLACFGPolicy(SmolVLAPolicy):
 
         step_action = pad_vector(step_action, self.config.max_action_dim).cpu()
         self._history_buffer.append((step_action.clone(), True))
-
 
 def pad_tensor(tensor, max_len, pad_value=0):
     """

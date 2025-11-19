@@ -23,6 +23,8 @@ venv.bak/
 __pypackages__/
 node_modules/
 
+eval_result/
+
 # Lock files
 poetry.lock
 uv.lock

@@ -103,7 +103,8 @@ class SmolVLAConfig(PreTrainedConfig):
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
 
-    # Real Time Chunking configuration
+    # different decoding strategy like naive bid rtc
+    decoding_strategy: str = "naive"
     rtc_config: RTCConfig = RTCConfig()
 
     def __post_init__(self):
@@ -159,16 +160,23 @@ class SmolVLAConfig(PreTrainedConfig):
         return None
 
 
+
+'''
+
+lerobot-train   --policy.type=smolvla_cfg   --policy.repo_id=chen4803/libero-test    --dataset.repo_id=HuggingFaceVLA/libero   --env.type=libero   --env.task=libero_10  --wandb.enable=True  --policy.load_vlm_weights=true  --steps=40000  --save_freq 5000 --batch_size=64   --eval.batch_size=2 --eval.n_episodes=4 --eval_freq=5000 --output_dir=./outputs/actioncontext_chunk10 --job_name actioncontext_chunk10
+'''
 @PreTrainedConfig.register_subclass("smolvla_cfg")
 @dataclass
 class SmolVLA_CFG_Config(SmolVLAConfig):
     """Extended SmolVLA config that requests historical expert actions for conditioning."""
+    chunk_size: int = 10
+    n_action_steps: int = 10 # should be < chunksize
 
     decoding_strategy: str = "naive"
     decoding_kwargs: dict[str, Any] = field(default_factory=dict)
-    history_action_steps: int = 20 #10
-    drop_pastaction_prob: float = 0.15
-    drop_obs_prob: float = 0.15
+    history_action_steps: int = 10 #10 # should be < chunksize
+    drop_pastaction_prob: float = 0.0
+    drop_obs_prob: float = 0.0
     history_action_noise_std: float = 0.1             #Training dr
 
     rtc_config=None
